@@ -687,7 +687,12 @@ export const useAgentStore = defineStore('agent', () => {
           addLog('路径Agent 完成 → 学习路径规划')
           // 尝试将路径结果写入 pathStore
           try {
-            const pathBlock = extractCodeBlock(pathResult, 'path-plan')
+            let pathBlock = extractCodeBlock(pathResult, 'path-plan')
+            // 兜底：当 LLM 不输出 path-plan 代码块时，尝试直接解析 JSON
+            if (!pathBlock) {
+              const jsonMatch = pathResult.match(/\{[\s\S]*"stages"[\s\S]*\}/)
+              if (jsonMatch) pathBlock = jsonMatch[0]
+            }
             if (pathBlock) {
               const pathData = JSON.parse(pathBlock)
               if (pathData.stages && Array.isArray(pathData.stages)) {
@@ -696,7 +701,12 @@ export const useAgentStore = defineStore('agent', () => {
                   resourceStore.clearAndSetResources(generatedResources, subject)
                 }
                 pathStore.setAgentGeneratedStages(pathData)
+                addLog(`路径Agent 完成 → 生成了 ${pathData.stages.length} 个学习阶段`)
+              } else {
+                addLog('路径Agent JSON 缺少 stages 字段')
               }
+            } else {
+              addLog('路径Agent 结果中未找到 paths-plan 或 JSON')
             }
           } catch {
             addLog('路径Agent 结果解析失败，已保留原始输出')
