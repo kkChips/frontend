@@ -223,7 +223,7 @@ export const useAgentStore = defineStore('agent', () => {
 
       try {
         // 1. 创建视频生成任务
-        const createRes = await request<{ status: string; task_id?: string; message?: string }>({
+        const createRes = await request<{ status: string; task_id?: string; message?: string; video_url?: string }>({
           url: '/video/generate',
           method: 'POST',
           data: { knowledge_point: knowledgePoint, style: 'rigorous' }
@@ -243,6 +243,32 @@ export const useAgentStore = defineStore('agent', () => {
         }
 
         const taskId = createRes.task_id
+
+        // ★ 关键修复：如果后端直接返回 completed（缓存命中），直接完成，不启动轮询
+        // 避免使用旧 task_id 轮询导致 404 风暴
+        if (createRes.status === 'completed' && createRes.video_url) {
+          agent.status = 'completed'
+          agent.progress = 100
+          agent.log = ['视频生成完成（缓存命中）', createRes.video_url]
+          addLog(`✅ 视频命中缓存，直接返回: ${createRes.video_url}`)
+
+          const cachedResource: ResourceItem = {
+            id: `video-${taskId}`,
+            title: `${knowledgePoint} 教学视频`,
+            type: 'video',
+            module: knowledgePoint,
+            url: createRes.video_url,
+            description: 'AI生成的教学动画视频（缓存命中）',
+            createdAt: new Date().toISOString(),
+            aiGenerated: true,
+            difficulty: 'beginner',
+            videoStatus: 'done',
+            video_task_id: taskId,
+          }
+          resolve(cachedResource)
+          return
+        }
+
         agent.progress = 15
         agent.log = ['任务已创建，后台渲染中...', `task_id: ${taskId}`]
         addLog(`视频任务已创建: ${taskId}，后台渲染中（不阻塞其他Agent）`)
@@ -730,6 +756,15 @@ export const useAgentStore = defineStore('agent', () => {
         addLog(`检测到 ${allocResult.gaps.length} 个资源缺口，开始为每个小节生成专属资源...`)
         workflowStage.value = 4
 
+        // ★ 关键修复：Stage 4.5 必须尊重用户勾选
+        // 只为用户勾选的 Agent 类型对应的资源缺口生成新资源
+        // 未勾选的类型：仅尝试复用已有资源，不调用 Agent 生成
+        const userSelectedTypes = new Set<string>()
+        for (const idx of selectedAgents) {
+          const t = AGENT_RESOURCE_TYPE[idx]
+          if (t) userSelectedTypes.add(t)
+        }
+
         // 混合策略：最多并行生成3个视频（非阻塞后台渲染），其余视频缺口尝试复用资源池
         // 理由：executeVideoAgent 是非阻塞的，创建任务后立即返回占位资源，
         //       3个并行不会阻塞其他Agent；Manim渲染在后台进行
@@ -737,8 +772,19 @@ export const useAgentStore = defineStore('agent', () => {
         const videoGaps = allocResult.gaps.filter(g => g.type === 'video')
         const nonVideoGaps = allocResult.gaps.filter(g => g.type !== 'video')
 
+        // 过滤：未勾选类型的缺口，只走复用，不新生成
+        const videoGapsAllowed = videoGaps.filter(g => userSelectedTypes.has('video'))
+        const videoGapsSkipped = videoGaps.filter(g => !userSelectedTypes.has('video'))
+        const nonVideoGapsAllowed = nonVideoGaps.filter(g => userSelectedTypes.has(g.type))
+        const nonVideoGapsSkipped = nonVideoGaps.filter(g => !userSelectedTypes.has(g.type))
+
+        if (videoGapsSkipped.length > 0 || nonVideoGapsSkipped.length > 0) {
+          addLog(`📋 跳过未勾选类型的缺口生成：${videoGapsSkipped.length} 个视频 + ${nonVideoGapsSkipped.length} 个其他（仅尝试复用）`)
+        }
+
         // 按小节重要性排序视频缺口：薄弱点 > 基础 > 进阶
-        const videoGapsSorted = videoGaps.map(g => {
+        // ★ 使用 videoGapsAllowed（只含用户勾选视频的缺口）而非全部 videoGaps
+        const videoGapsSorted = videoGapsAllowed.map(g => {
           const stage = pathStore.stages.find(s => s.id === g.stageId)
           const priority = stage?.reasonType === 'weakness' ? 0
             : stage?.reasonType === 'foundation' ? 1
@@ -750,9 +796,12 @@ export const useAgentStore = defineStore('agent', () => {
         const videoGapsToGen = videoGapsSorted.slice(0, MAX_NEW_VIDEOS)
         const videoGapsToReuse = videoGapsSorted.slice(MAX_NEW_VIDEOS)
 
-        if (videoGapsToReuse.length > 0) {
-          addLog(`视频策略：新生成${videoGapsToGen.length}个，尝试复用${videoGapsToReuse.length}个已有视频`)
-          for (const gap of videoGapsToReuse) {
+        // 未勾选视频的缺口也尝试复用（不生成新的）
+        const videoGapsToReuseAll = [...videoGapsToReuse, ...videoGapsSkipped]
+
+        if (videoGapsToReuseAll.length > 0) {
+          addLog(`视频策略：新生成${videoGapsToGen.length}个，尝试复用${videoGapsToReuseAll.length}个已有视频`)
+          for (const gap of videoGapsToReuseAll) {
             // 优先精确匹配 topic，其次匹配同学科任意视频
             const exactMatch = resourceStore.resources.find(r =>
               r.type === 'video' && r.module === gap.topic && r.videoStatus === 'done' && r.url
@@ -770,7 +819,20 @@ export const useAgentStore = defineStore('agent', () => {
           }
         }
 
-        const gapsToGen = [...videoGapsToGen, ...nonVideoGaps]
+        // ★ 未勾选的其他类型缺口也尝试复用（不生成新的）
+        for (const gap of nonVideoGapsSkipped) {
+          const reused = resourceStore.resources.find(r =>
+            r.type === gap.type && r.module === gap.topic
+          )
+          if (reused) {
+            generatedResources.push({ ...reused, id: `reuse-${Date.now()}-${gap.prId.slice(-4)}` })
+            addLog(`📎 复用已有「${reused.title}」→ ${gap.stageTitle}`)
+          } else {
+            addLog(`📋 「${gap.stageTitle}」未勾选生成此类型，已跳过`)
+          }
+        }
+
+        const gapsToGen = [...videoGapsToGen, ...nonVideoGapsAllowed]
 
         // 并行生成所有缺口资源
         const gapPromises: Promise<ResourceItem | null>[] = gapsToGen.map(async (gap) => {
@@ -896,6 +958,13 @@ export const useAgentStore = defineStore('agent', () => {
         resourceStore.clearAndSetResources(generatedResources, subject)
         // 重新建立路径-资源关联，确保 Reviewer 修订后 resourceRef 仍指向正确资源
         pathStore.linkResourcesToGenerated()
+        // ★ 强制立即保存到 localStorage，避免 watch 防抖 500ms 期间刷新丢失
+        try {
+          resourceStore.saveResources()
+          addLog(`✅ 已强制保存 ${generatedResources.length} 项资源到本地存储`)
+        } catch (e: any) {
+          addLog(`⚠️ 资源保存失败: ${e?.message || e}`)
+        }
         addLog(`✅ 全部Agent完成，共生成 ${generatedResources.length} 项资源已写入资源中心`)
       } else {
         addLog('✅ 全部Agent完成，但无有效资源生成')
